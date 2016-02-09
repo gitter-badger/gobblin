@@ -26,6 +26,7 @@ import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.util.Properties;
 
@@ -37,6 +38,7 @@ public class AdminWebServer extends AbstractIdleService {
 
     private final Properties properties;
     private final URI restServerUri;
+    private final URI serverUri;
     protected Server server;
 
     public AdminWebServer(Properties properties, URI restServerUri) {
@@ -45,18 +47,22 @@ public class AdminWebServer extends AbstractIdleService {
 
         this.properties = properties;
         this.restServerUri = restServerUri;
-    }
-
-    @Override
-    protected void startUp() throws Exception {
         int port = Integer.parseInt(
                 properties.getProperty(
                         ConfigurationKeys.ADMIN_SERVER_PORT_KEY,
                         ConfigurationKeys.DEFAULT_ADMIN_SERVER_PORT));
+        serverUri = URI.create(String.format("http://%s:%d",
+                properties.getProperty(
+                        ConfigurationKeys.ADMIN_SERVER_HOST_KEY,
+                        ConfigurationKeys.DEFAULT_ADMIN_SERVER_HOST),
+                port));
+    }
 
+    @Override
+    protected void startUp() throws Exception {
         LOGGER.info("Starting the admin web server");
 
-        server = new Server(port);
+        server = new Server(new InetSocketAddress(serverUri.getHost(), serverUri.getPort()));
 
         HandlerCollection handlerCollection = new HandlerCollection();
 
