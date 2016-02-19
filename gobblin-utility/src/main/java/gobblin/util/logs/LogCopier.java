@@ -20,9 +20,6 @@ import java.io.OutputStreamWriter;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
@@ -32,6 +29,9 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.PathFilter;
+import org.jboss.netty.util.HashedWheelTimer;
+import org.jboss.netty.util.Timeout;
+import org.jboss.netty.util.TimerTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -128,12 +128,12 @@ public class LogCopier extends AbstractScheduledService {
 
   private final int linesWrittenBeforeFlush;
 
-  private final ScheduledExecutorService logCopyExecutor;
+  private final HashedWheelTimer logCopyExecutor;
 
   // A map from source log file paths to an entry that stores the ScheduledFuture of the copy
   // task for the log file and the current position to which the copier has copied to. This
   // is accessed by a single thread so no synchronization is needed.
-  private final Map<Path, ScheduledFuture<?>> logCopyTaskMap = Maps.newHashMap();
+  private final Map<Path, LogCopyTask> logCopyTaskMap = Maps.newHashMap();
 
   private LogCopier(Builder builder) {
     this.srcFs = builder.srcFs;
@@ -157,13 +157,16 @@ public class LogCopier extends AbstractScheduledService {
 
     this.linesWrittenBeforeFlush = builder.linesWrittenBeforeFlush;
 
-    this.logCopyExecutor = Executors.newScheduledThreadPool(0,
-        ExecutorsUtils.newThreadFactory(Optional.of(LOGGER), Optional.of("LogCopyExecutor")));
+    this.logCopyExecutor = new HashedWheelTimer(
+            ExecutorsUtils.newThreadFactory(Optional.of(LOGGER), Optional.of("LogCopyExecutor")));
   }
 
   @Override
   protected void shutDown() throws Exception {
-    ExecutorsUtils.shutdownExecutorService(this.logCopyExecutor, Optional.of(LOGGER));
+    for (LogCopyTask logCopyTask : this.logCopyTaskMap.values()) {
+      logCopyTask.stop();
+    }
+    this.logCopyExecutor.stop();
   }
 
   @Override
@@ -209,14 +212,14 @@ public class LogCopier extends AbstractScheduledService {
           ? this.logFileNamePrefix.get() + "." + srcLogFile.getName() : srcLogFile.getName();
       final Path destLogFile = new Path(this.destLogDir, destLogFileName);
 
-      ScheduledFuture<?> copyFuture = this.logCopyExecutor.scheduleAtFixedRate(new LogCopyTask(srcLogFile, destLogFile),
-          0, this.copyInterval, this.timeUnit);
-      this.logCopyTaskMap.put(srcLogFile, copyFuture);
+      LogCopyTask logCopyTask = new LogCopyTask(this.logCopyExecutor, srcLogFile, destLogFile, this.copyInterval, this.timeUnit);
+      logCopyTask.start();
+      this.logCopyTaskMap.put(srcLogFile, logCopyTask);
     }
 
     // Cancel the copy task for each deleted log file
     for (Path deletedLogFile : deletedLogFiles) {
-      this.logCopyTaskMap.remove(deletedLogFile).cancel(true);
+      this.logCopyTaskMap.remove(deletedLogFile).stop();
     }
   }
 
@@ -440,29 +443,66 @@ public class LogCopier extends AbstractScheduledService {
   /**
    * A log copy task that manages the current source log file position itself.
    */
-  private class LogCopyTask implements Runnable {
+  private class LogCopyTask implements TimerTask {
 
+    private final Object syncObject = new Object();
+    private final HashedWheelTimer timer;
     private final Path srcLogFile;
     private final Path destLogFile;
+    private final long interval;
+    private final TimeUnit timeUnit;
     private final Stopwatch watch;
 
     // The task maintains the current source log file position itself
     private long currentPos = 0;
+    private volatile Timeout future;
 
-    LogCopyTask(Path srcLogFile, Path destLogFile) {
+    LogCopyTask(HashedWheelTimer timer, Path srcLogFile, Path destLogFile, long interval, TimeUnit timeUnit) {
+      this.timer = timer;
       this.srcLogFile = srcLogFile;
       this.destLogFile = destLogFile;
+      this.interval = interval;
+      this.timeUnit = timeUnit;
       this.watch = Stopwatch.createStarted();
     }
 
+    public void start() {
+      if (future == null) {
+        synchronized (syncObject) {
+          if (future == null) {
+            future = this.timer.newTimeout(this, this.interval, this.timeUnit);
+          }
+        }
+      }
+    }
+
+    public void stop() {
+      if (future != null) {
+        synchronized (syncObject) {
+          if (future != null) {
+            future.cancel();
+            future = null;
+          }
+        }
+      }
+    }
+
     @Override
-    public void run() {
+    public void run(Timeout timeout) throws Exception {
       try {
         createNewLogFileIfNeeded();
         LOGGER.debug(String.format("Copying changes from %s to %s", this.srcLogFile, this.destLogFile));
         copyChangesOfLogFile(srcFs.makeQualified(this.srcLogFile), destFs.makeQualified(this.destLogFile));
       } catch (IOException ioe) {
         LOGGER.error(String.format("Failed while copying logs from %s to %s", this.srcLogFile, this.destLogFile), ioe);
+      } finally {
+        if (future != null) {
+          synchronized (syncObject) {
+            if (future != null) {
+              future = this.timer.newTimeout(this, this.interval, this.timeUnit);
+            }
+          }
+        }
       }
     }
 
